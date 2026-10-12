@@ -1,47 +1,81 @@
-# Competitor Pricing Dynamics: Leader–Follower Analysis
+# Competitor Pricing Dynamics: Who Reacts, How Fast, and Who Leads
 
-Analysis of competitor price reaction patterns for a leading Dutch online consumer electronics retailer — developed as a multi-week industry case study at Erasmus University Rotterdam.
+How do competitors respond when a leading Dutch online consumer-electronics retailer ("Company X") changes a price? This repository contains the analysis code for a multi-week industry case study at Erasmus University Rotterdam (MSc Data Science and Marketing Analytics). It uses high-frequency scraped price data for mobile phones and vacuum cleaners in Belgium and the Netherlands.
 
-> **Note:** Data is proprietary and not included in this repository. Scripts reference local CSV paths and can be adapted to equivalent data.
+> **Data:** the price data are proprietary and not included. The code runs on the original four CSV files (see [Running the analysis](#running-the-analysis)).
 
-## Business Question
-When a retailer changes its price, do competitors react — and if so, how quickly, in what direction, and which competitors lead vs. follow?
+## Research question
 
-## Data (not included)
-High-frequency web-scraped pricing data across two product categories × two markets:
-- Mobile phones — Belgium & Netherlands
-- Vacuum cleaners — Belgium & Netherlands
-- 2.35M+ observations, September 2024 – December 2025
-- Structured at product × competitor × timestamp level
+*How do competitors' pricing behaviours interact with Company X's pricing decisions across products and markets, and how can these interactions improve Company X's pricing strategy?*
 
-## Methods & Scripts
+| Sub-question | Answered by |
+|---|---|
+| SQ1 Which competitors lead and which follow? | Multinomial role model, role profiles |
+| SQ2 How do competitors respond in timing, direction and magnitude? | Descriptives, hazard model |
+| SQ3 How do responses differ across categories and countries? | All models (category and country terms), per-category clustering |
+| SQ4 How do promotions and other context change reactions? | Mixed logit, hazard interactions, role model |
+| SQ5 How can behaviour be segmented into actionable types? | Post-estimation clustering |
 
-| Script | Stage | Method |
+## Approach
+
+**From prices to events.** Every Company X price change is an *event*. A competitor enters the event's risk set if it sells the same product in the same country and posted a price in the 72 hours before the event. For each event–competitor pair:
+
+| Construct | Definition |
+|---|---|
+| Response (follower) | competitor changes its price within **24 h after** the event |
+| Leader | competitor changed its price within **6 h before** the event |
+| Response delay | hours from the event to the competitor's first price change |
+| Price gap | competitor's pre-event price relative to Company X's new price |
+| Repricing frequency | competitor's price changes per day (structural speed) |
+
+**Models.**
+
+| Step | Method | Question |
 |---|---|---|
-| `company_x_Case_Study_NEW_CLEAN.R` | Data wrangling + EDA | `tidyverse`, summary stats, 5 simple analyses |
-| `company_x_leader_follower_model.R` | Binary response model | Mixed-effects logistic regression (`lme4`) |
-| `company_x_multinomial_leader_follower.R` | Three-class model | Multinomial logistic regression (`nnet`) |
-| `company_x_multinomial_mixed_logit.R` | Final model | Multinomial mixed logit with competitor/product effects |
+| Model 1 | Mixed-effects logit, random intercepts for competitor and product (`lme4`) | *Whether* a competitor responds within 24 h |
+| Model 2 | Discrete-time hazard (person-hour logit with hour dummies, right-censored at 24 h) | *When* a competitor responds; price-gap, promotion and direction effects |
+| Model 3 | Multinomial logit: no action / follower / leader (`nnet`) | *Which role* a competitor takes around a price change |
+| Segmentation | k-means (k = 3, per category) on model-implied propensity, speed and aggressiveness, validated with silhouette widths | Competitor archetypes for monitoring and pricing rules |
 
-### Modelling Approach
-Price change **events** are defined as discrete adjustments by the focal retailer. For each event, all competitors are observed within a **24-hour response window** (chosen based on empirical distribution: median reaction ~14 hours, 75th percentile ~20 hours).
+## Key findings
 
-Two response dimensions are modelled:
-1. **Response probability** — whether a competitor reacts within 24 hours (binary logit with mixed effects)
-2. **Response role** — leader / follower / inactive (multinomial logit)
+- **Reactions are selective.** Most event–competitor pairs show no price move around a Company X change, so a temporary pricing window usually exists.
+- **Who is watching matters more than what is sold.** Competitor relevance is the strongest driver of response, and the competitor-level random effect is much larger than the product-level one. A small set of large, active retailers accounts for most leading and following.
+- **Promotions are competitive signals.** Promoted price changes raise the chance of being followed and change how the price gap matters.
+- **Proximity is non-linear.** Mid-range gaps to Company X's new price create the most urgency for mobile phones; very small and very large gaps trigger fewer reactions.
+- **Structural speed counts.** Competitors that reprice often respond faster, regardless of strategic importance.
+- **Categories differ.** Mobile phones and vacuum cleaners differ in response intensity and in the structure of competitor archetypes, which supports category-specific pricing governance.
 
-## Key Findings
-- **Reactions are not automatic**: most competitor–event pairs show no response within 24 hours, implying tactical pricing space often exists after a price change
-- **Concentration among a few rivals**: a small subset of large, active competitors accounts for the majority of leadership and followership behaviour; most sellers remain passive
-- **Promotions accelerate retaliation**: promotional activity significantly increases both the probability and speed of competitor reactions — promotions act as competitive signals, not just demand levers
-- **Category and market heterogeneity**: competitive dynamics differ substantially between mobile phones and vacuum cleaners, and between Belgium and the Netherlands — uniform pricing rules are suboptimal
+## Repository structure
 
-## Managerial Implications
-- Monitoring systems should be **tiered**: high-frequency tracking for strategically relevant competitors, fewer resources for fringe players
-- Promotional strategy should explicitly incorporate **expected retaliation risk**
-- Pricing governance should be **category- and market-specific**
+```
+run_all.R                    runs the full pipeline in order
+R/00_setup.R                 packages, paths, analysis parameters, helpers
+R/01_data_and_events.R       cleaning, Company X events, event × competitor panel
+R/02_descriptives.R          descriptive statistics and appendix tables
+R/03_mixed_logit.R           Model 1: response probability
+R/04_hazard.R                Model 2: response timing, price-gap and threshold analysis
+R/05_multinomial_roles.R     Model 3: leader / follower / no-action roles
+R/06_clustering.R            competitor archetypes and silhouette validation
+```
 
-## Tech Stack
-- R
-- `tidyverse` · `lubridate` · `data.table`
-- `lme4` · `nnet`
+All analysis parameters (windows, lookback, thresholds, number of clusters, seed) are set once in `R/00_setup.R`.
+
+## Running the analysis
+
+Requirements: R ≥ 4.3 with `tidyverse`, `lubridate`, `lme4`, `nnet`, `broom`, `broom.mixed`, `cluster`, `scales`.
+
+```bash
+PRICE_DATA_DIR=/path/to/csv/folder \
+FOCAL_NAMES="companyx.nl,companyx.be" \
+Rscript run_all.R
+```
+
+- `PRICE_DATA_DIR` is the folder with the four `competitor_price_data_*.csv` files.
+- `FOCAL_NAMES` lists the focal retailer's website names as they appear in `competitor_name`.
+
+Results are written to `output/tables` (CSV) and `output/figures` (PNG). A full run takes a few minutes; most of the time is spent on the mixed-effects models and the threshold analysis.
+
+## Tech stack
+
+R · tidyverse · lme4 · nnet · cluster

@@ -1,3 +1,11 @@
+# Proprietary data and generated results
 *.csv
 *.RData
+*.rds
 data/
+output/
+
+# R / OS
+.Rhistory
+.Rproj.user/
+.DS_Store
