@@ -11,49 +11,78 @@ log_step("04  Discrete-time hazard model")
 
 HORIZON_H <- RESPONSE_WINDOW_H
 
-hazard_base <- event_level %>%
-  drop_na(competitor_relevance, assortment_overlap, reprice_freq, abs_gap,
-          cx_promo, cx_abs_change, cx_direction) %>%
-  mutate(
-    status   = responded,
-    # hour bin in which the response falls (1 = first hour); censored at 24h
-    event_hour = if_else(status == 1, pmax(1L, as.integer(ceiling(response_delay_h))), NA_integer_),
-    last_hour  = if_else(status == 1, event_hour, as.integer(HORIZON_H)),
-    pair_id    = row_number()
-  )
-
-# Centring constants (kept so that every prediction uses the same scale)
-hz_center <- hazard_base %>%
-  summarise(relevance = mean(competitor_relevance), overlap = mean(assortment_overlap),
-            reprice_freq = mean(reprice_freq), abs_gap = mean(abs_gap),
-            abs_change = mean(cx_abs_change)) %>%
-  as.list()
-
-hz_levels <- list(
-  country          = sort(unique(hazard_base$country)),
-  product_category = sort(unique(hazard_base$product_category)),
-  cx_direction     = c("decrease", "increase")
-)
-
 # Turn raw covariate values into the model's (centred, factor) scale
-hz_prepare <- function(d) {
+hz_prepare <- function(d, center = hz_center, levels = hz_levels) {
+  if (!"gap_missing" %in% names(d)) d$gap_missing <- 0L
   d %>% mutate(
-    relevance_c      = competitor_relevance - hz_center$relevance,
-    overlap_c        = assortment_overlap   - hz_center$overlap,
-    reprice_freq_c   = reprice_freq         - hz_center$reprice_freq,
-    abs_gap_c        = abs_gap              - hz_center$abs_gap,
-    abs_change_c     = cx_abs_change        - hz_center$abs_change,
-    country          = factor(country,          levels = hz_levels$country),
-    product_category = factor(product_category, levels = hz_levels$product_category),
-    cx_direction     = factor(cx_direction,     levels = hz_levels$cx_direction)
+    relevance_c      = competitor_relevance - center$relevance,
+    overlap_c        = assortment_overlap   - center$overlap,
+    reprice_freq_c   = reprice_freq         - center$reprice_freq,
+    abs_gap_c        = abs_gap              - center$abs_gap,
+    abs_change_c     = cx_abs_change        - center$abs_change,
+    country          = factor(country,          levels = levels$country),
+    product_category = factor(product_category, levels = levels$product_category),
+    cx_direction     = factor(cx_direction,     levels = levels$cx_direction)
   )
 }
 
-hazard_long <- hazard_base %>%
-  uncount(last_hour, .id = "t", .remove = FALSE) %>%
-  mutate(y = as.integer(status == 1 & t == event_hour),
-         t = factor(t, levels = 1:HORIZON_H)) %>%
-  hz_prepare()
+# Build the pair-level base table, centring constants and person-hour data
+hazard_inputs <- function(el) {
+  base <- el %>%
+    drop_na(competitor_relevance, assortment_overlap, reprice_freq,
+            cx_promo, cx_abs_change, cx_direction) %>%
+    mutate(
+      # only the "country" risk set has competitors without a price for the
+      # product; their gap is set to the mean and flagged
+      gap_missing = as.integer(is.na(abs_gap)),
+      abs_gap     = if_else(is.na(abs_gap), mean(abs_gap, na.rm = TRUE), abs_gap),
+      status      = responded,
+      # hour bin in which the response falls (1 = first hour); censored at 24h
+      event_hour  = if_else(status == 1, pmax(1L, as.integer(ceiling(response_delay_h))), NA_integer_),
+      last_hour   = if_else(status == 1, event_hour, as.integer(HORIZON_H)),
+      pair_id     = row_number()
+    )
+  center <- base %>%
+    summarise(relevance = mean(competitor_relevance), overlap = mean(assortment_overlap),
+              reprice_freq = mean(reprice_freq), abs_gap = mean(abs_gap),
+              abs_change = mean(cx_abs_change)) %>%
+    as.list()
+  levels <- list(country          = sort(unique(base$country)),
+                 product_category = sort(unique(base$product_category)),
+                 cx_direction     = c("decrease", "increase"))
+  long <- base %>%
+    uncount(last_hour, .id = "t", .remove = FALSE) %>%
+    mutate(y = as.integer(status == 1 & t == event_hour),
+           t = factor(t, levels = 1:HORIZON_H)) %>%
+    hz_prepare(center, levels)
+  list(base = base, long = long, center = center, levels = levels)
+}
+
+hazard_formula_for <- function(long) {
+  f <- y ~ t +
+    relevance_c + overlap_c + cx_promo + abs_change_c + cx_direction +
+    abs_gap_c + reprice_freq_c + product_category + country +
+    abs_gap_c:relevance_c + abs_gap_c:cx_promo + abs_gap_c:cx_direction
+  if (n_distinct(long$gap_missing) > 1) f <- update(f, . ~ . + gap_missing)
+  f
+}
+
+# Coefficients with standard errors clustered by competitor: a competitor's
+# person-hours are not independent observations
+hazard_table <- function(model, long) {
+  robust_tidy(model, cluster = long$competitor_id) %>%
+    filter(term != "(Intercept)", !str_detect(term, "^t[0-9]+$")) %>%
+    mutate(odds_ratio = exp(estimate),
+           or_low  = exp(estimate - 1.96 * std.error),
+           or_high = exp(estimate + 1.96 * std.error),
+           sig = sig_stars(p.value))
+}
+
+hz <- hazard_inputs(event_level)
+hazard_base <- hz$base
+hazard_long <- hz$long
+hz_center   <- hz$center
+hz_levels   <- hz$levels
 
 # Integrity checks: one event per responder, none for censored pairs
 hazard_checks <- hazard_long %>%
@@ -65,20 +94,11 @@ hazard_checks <- hazard_long %>%
 stopifnot(hazard_checks$responders == hazard_checks$responders_with_one_event)
 save_table(hazard_checks, "model2_risk_set_checks")
 
-hazard_formula <- y ~ t +
-  relevance_c + overlap_c + cx_promo + abs_change_c + cx_direction +
-  abs_gap_c + reprice_freq_c + product_category + country +
-  abs_gap_c:relevance_c + abs_gap_c:cx_promo + abs_gap_c:cx_direction
+hazard_formula <- hazard_formula_for(hazard_long)
+hazard_model   <- glm(hazard_formula, data = hazard_long, family = binomial)
 
-hazard_model <- glm(hazard_formula, data = hazard_long, family = binomial)
-
-# Table 4 — coefficients (hour dummies omitted)
-table_4 <- tidy(hazard_model) %>%
-  filter(term != "(Intercept)", !str_detect(term, "^t[0-9]+$")) %>%
-  mutate(odds_ratio = exp(estimate),
-         or_low  = exp(estimate - 1.96 * std.error),   # Wald 95% CI
-         or_high = exp(estimate + 1.96 * std.error),
-         sig = sig_stars(p.value))
+# Table 4 — coefficients (hour dummies omitted), competitor-clustered SEs
+table_4 <- hazard_table(hazard_model, hazard_long)
 save_table(table_4, "table_4_hazard_coefficients")
 
 # Model fit: AIC and likelihood-ratio tests for the interactions and the
@@ -86,15 +106,16 @@ save_table(table_4, "table_4_hazard_coefficients")
 hazard_no_int  <- update(hazard_model, . ~ . - abs_gap_c:relevance_c - abs_gap_c:cx_promo -
                            abs_gap_c:cx_direction)
 hazard_no_time <- update(hazard_model, . ~ . - t)
+lrt_int  <- anova(hazard_no_int,  hazard_model, test = "LRT")
+lrt_time <- anova(hazard_no_time, hazard_model, test = "LRT")
 hazard_fit <- tibble(
-  pairs = nrow(hazard_base), person_hours = nrow(hazard_long), AIC = AIC(hazard_model),
-  lrt_interactions_chisq = anova(hazard_no_int, hazard_model, test = "LRT")$Deviance[2],
-  lrt_interactions_p     = anova(hazard_no_int, hazard_model, test = "LRT")$`Pr(>Chi)`[2],
-  lrt_hour_dummies_chisq = anova(hazard_no_time, hazard_model, test = "LRT")$Deviance[2],
-  lrt_hour_dummies_p     = anova(hazard_no_time, hazard_model, test = "LRT")$`Pr(>Chi)`[2]
+  risk_set = RISK_SET, pairs = nrow(hazard_base), person_hours = nrow(hazard_long),
+  AIC = AIC(hazard_model),
+  lrt_interactions_chisq = lrt_int$Deviance[2],  lrt_interactions_p = lrt_int$`Pr(>Chi)`[2],
+  lrt_hour_dummies_chisq = lrt_time$Deviance[2], lrt_hour_dummies_p = lrt_time$`Pr(>Chi)`[2]
 )
 save_table(hazard_fit, "model2_fit")
-rm(hazard_no_int, hazard_no_time)
+rm(hazard_no_int, hazard_no_time, lrt_int, lrt_time)
 
 # -----------------------------------------------------------------------------
 # Prediction helper: cumulative response probability over hours 1..24
@@ -104,7 +125,7 @@ hz_typical <- list(
   competitor_relevance = hz_center$relevance, assortment_overlap = hz_center$overlap,
   reprice_freq = hz_center$reprice_freq,
   cx_abs_change = median(hazard_base$cx_abs_change),
-  cx_promo = 0, country = hz_levels$country[1]
+  cx_promo = 0, gap_missing = 0L, country = hz_levels$country[1]
 )
 
 hz_cumulative <- function(scenarios) {
@@ -196,11 +217,15 @@ save_table(dominance, "model2_gap_vs_magnitude")
 # Figure 2 — non-linear proximity ("threat zone") by category and direction
 # Re-estimate the hazard within each category × direction subset with a
 # near-parity indicator 1(|gap| < threshold) for a range of thresholds.
+# Standard errors are clustered by competitor.
 # -----------------------------------------------------------------------------
 log_step("04  Threshold analysis")
 
 threshold_formula <- y ~ t + relevance_c + overlap_c + cx_promo + abs_change_c + parity +
   abs_gap_c + abs_gap_c:relevance_c + abs_gap_c:cx_promo + reprice_freq_c + country
+if (n_distinct(hazard_long$gap_missing) > 1) {
+  threshold_formula <- update(threshold_formula, . ~ . + gap_missing)
+}
 
 threshold_results <- expand_grid(product_category = hz_levels$product_category,
                                  cx_direction = hz_levels$cx_direction,
@@ -210,7 +235,7 @@ threshold_results <- expand_grid(product_category = hz_levels$product_category,
       filter(product_category == cat, cx_direction == dir) %>%
       mutate(parity = as.integer(abs_gap < thr))
     if (n_distinct(d$parity) < 2) return(tibble(estimate = NA_real_, std.error = NA_real_, p.value = NA_real_))
-    tidy(glm(threshold_formula, data = d, family = binomial)) %>%
+    robust_tidy(glm(threshold_formula, data = d, family = binomial), cluster = d$competitor_id) %>%
       filter(term == "parity") %>% select(estimate, std.error, p.value)
   })) %>%
   unnest(fit) %>%

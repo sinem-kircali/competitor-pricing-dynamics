@@ -11,6 +11,7 @@ suppressPackageStartupMessages({
   library(broom.mixed)
   library(cluster)
   library(scales)
+  library(sandwich)
 })
 
 # -----------------------------------------------------------------------------
@@ -45,10 +46,22 @@ RESPONSE_WINDOW_H  <- 24                  # follower: competitor moves within 24
 LEAD_WINDOW_H      <- 6                   # leader:   competitor moves within 6h before the event
 ACTIVE_LOOKBACK_H  <- 72                  # competitor is "in the market" for the product if it
                                           # posted a price in the 72h before the event
+# Which competitors form the risk set of an event:
+#   "listing" (default) competitors that offer the product in that country and
+#                       posted a price in the ACTIVE_LOOKBACK_H hours before
+#   "country"           every competitor active in the country with assortment
+#                       overlap > 0, whether or not it sells the product
+#                       (the definition used for the figures in the final report)
+RISK_SET           <- Sys.getenv("RISK_SET", unset = "listing")
+stopifnot(RISK_SET %in% c("listing", "country"))
 ROBUSTNESS_WINDOWS <- c(6, 24, 48, 72, 168)
 GAP_THRESHOLDS     <- c(0.01, 0.02, 0.03, 0.05, 0.07, 0.10, 0.12, 0.15, 0.20, 0.25)
-MIN_EXPOSURE_PAIRS <- 200                 # minimum event-competitor pairs to enter the clustering
+MIN_EXPOSURE_PAIRS <- 100                 # minimum event-competitor pairs to enter the clustering
+                                          # (at 200 one vacuum cluster is a single competitor)
 N_CLUSTERS         <- 3
+LOOKBACK_SENSITIVITY  <- c(24, 72, 168)    # robustness of the "listing" risk set
+EXPOSURE_SENSITIVITY  <- c(50, 100, 200, 400)
+K_SENSITIVITY         <- 2:5
 SEED               <- 123
 
 set.seed(SEED)
@@ -90,6 +103,25 @@ auc_rank <- function(y, p) {
   r <- rank(p)
   n1 <- sum(y == 1); n0 <- sum(y == 0)
   (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+# Coefficient table with cluster-robust (sandwich) standard errors
+robust_tidy <- function(model, cluster) {
+  V  <- vcovCL(model, cluster = cluster, type = "HC0")
+  b  <- coef(model)
+  se <- sqrt(diag(V))[names(b)]
+  tibble(term = names(b), estimate = unname(b), std.error = unname(se)) %>%
+    mutate(statistic = estimate / std.error, p.value = 2 * pnorm(-abs(statistic)))
+}
+
+# Adjusted Rand index between two partitions of the same items
+adjusted_rand <- function(a, b) {
+  tab <- table(a, b)
+  comb2 <- function(x) sum(x * (x - 1) / 2)
+  index <- comb2(tab); expected <- comb2(rowSums(tab)) * comb2(colSums(tab)) / comb2(sum(tab))
+  max_index <- (comb2(rowSums(tab)) + comb2(colSums(tab))) / 2
+  if (max_index == expected) return(1)
+  (index - expected) / (max_index - expected)
 }
 
 log_step <- function(...) message(format(Sys.time(), "%H:%M:%S"), "  ", ...)

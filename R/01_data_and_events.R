@@ -106,12 +106,15 @@ competitor_attributes <- comp_rows %>%
 # -----------------------------------------------------------------------------
 # 4. Event × competitor panel (risk set)
 # -----------------------------------------------------------------------------
-# A competitor is part of an event's risk set only if it offers the same
-# product in the same country and posted a price for it in the
-# ACTIVE_LOOKBACK_H hours before Company X's price change (§3.1: competition
-# is defined at the product–market level). This keeps retailers that do not
-# sell the product out of the "non-response" group.
-log_step("01  Building event x competitor panel")
+# risk_set = "listing": a competitor is part of an event's risk set only if it
+#   offers the same product in the same country and posted a price for it in
+#   the `lookback_h` hours before Company X's price change (§3.1: competition is
+#   defined at the product–market level). Retailers that do not sell the
+#   product are therefore not counted as "non-responders".
+# risk_set = "country": every competitor active in the country with assortment
+#   overlap > 0, paired with every event (the grid behind the report's figures).
+#   Competitors without a price for the product have a missing price gap.
+log_step("01  Building event x competitor panel (risk set: ", RISK_SET, ")")
 
 comp_obs <- comp_rows %>%
   select(product_id, country, competitor_id, obs_time = scrape_datetime, comp_price_before = price)
@@ -122,60 +125,74 @@ comp_changes <- comp_rows %>%
          comp_change_pct = price_change_pct, comp_change_direction = change_direction,
          comp_price_after = price)
 
-product_competitors <- comp_rows %>% distinct(product_id, country, competitor_id)
+build_event_level <- function(risk_set = RISK_SET, lookback_h = ACTIVE_LOOKBACK_H) {
 
-event_grid <- cx_events %>%
-  select(product_id, country, cx_event_time) %>%
-  inner_join(product_competitors, by = c("product_id", "country"), relationship = "many-to-many") %>%
-  # last competitor price strictly before the event
-  left_join(comp_obs, by = join_by(product_id, country, competitor_id,
-                                   closest(cx_event_time > obs_time))) %>%
-  filter(!is.na(obs_time),
-         as.numeric(difftime(cx_event_time, obs_time, units = "hours")) <= ACTIVE_LOOKBACK_H) %>%
-  select(-obs_time)
+  candidates <- if (risk_set == "listing") {
+    comp_rows %>% distinct(product_id, country, competitor_id)
+  } else {
+    competitor_attributes %>%
+      filter(!is.na(assortment_overlap), assortment_overlap > 0) %>%
+      select(country, competitor_id)
+  }
 
-# first competitor price change AFTER the event (response) ...
-first_after <- event_grid %>%
-  select(product_id, country, competitor_id, cx_event_time) %>%
-  left_join(comp_changes, by = join_by(product_id, country, competitor_id,
-                                       closest(cx_event_time < change_time))) %>%
-  transmute(product_id, country, competitor_id, cx_event_time,
-            response_delay_h = as.numeric(difftime(change_time, cx_event_time, units = "hours")),
-            response_change_pct = comp_change_pct,
-            response_direction  = comp_change_direction)
+  event_grid <- cx_events %>%
+    select(product_id, country, cx_event_time) %>%
+    inner_join(candidates, by = intersect(c("product_id", "country"), names(candidates)),
+               relationship = "many-to-many") %>%
+    # last competitor price for the product strictly before the event
+    left_join(comp_obs, by = join_by(product_id, country, competitor_id,
+                                     closest(cx_event_time > obs_time))) %>%
+    mutate(hours_since_last_price = as.numeric(difftime(cx_event_time, obs_time, units = "hours")))
 
-# ... and last competitor price change BEFORE the event (leadership)
-last_before <- event_grid %>%
-  select(product_id, country, competitor_id, cx_event_time) %>%
-  left_join(comp_changes %>% select(product_id, country, competitor_id, change_time),
-            by = join_by(product_id, country, competitor_id, closest(cx_event_time > change_time))) %>%
-  transmute(product_id, country, competitor_id, cx_event_time,
-            lead_time_h = as.numeric(difftime(cx_event_time, change_time, units = "hours")))
+  if (risk_set == "listing") {
+    event_grid <- event_grid %>%
+      filter(!is.na(obs_time), hours_since_last_price <= lookback_h)
+  }
+  event_grid <- event_grid %>% select(-obs_time, -hours_since_last_price)
 
-event_level <- event_grid %>%
-  left_join(first_after, by = c("product_id", "country", "competitor_id", "cx_event_time")) %>%
-  left_join(last_before, by = c("product_id", "country", "competitor_id", "cx_event_time")) %>%
-  left_join(cx_events,   by = c("product_id", "country", "cx_event_time")) %>%
-  left_join(competitor_attributes, by = c("country", "competitor_id")) %>%
-  mutate(
-    # outcomes
-    responded  = as.integer(!is.na(response_delay_h) & response_delay_h <= RESPONSE_WINDOW_H),
-    led        = as.integer(!is.na(lead_time_h) & lead_time_h <= LEAD_WINDOW_H),
-    same_direction = if_else(responded == 1, response_direction == cx_direction, NA),
-    response_abs_change = if_else(responded == 1, abs(response_change_pct), NA_real_),
-    # role (§3.2): leader if the competitor moved before Company X (this
-    # includes competitors that also moved again afterwards), follower if it
-    # only moved after, otherwise no action
-    role3 = factor(case_when(led == 1 ~ "leader", responded == 1 ~ "follower", TRUE ~ "no_action"),
-                   levels = c("no_action", "follower", "leader")),
-    # price proximity at the event: competitor's pre-event price vs Company X's new price
-    price_gap_pct = (comp_price_before - cx_price) / cx_price,
-    abs_gap       = abs(price_gap_pct)
-  )
+  # first competitor price change AFTER the event (response) ...
+  first_after <- event_grid %>%
+    select(product_id, country, competitor_id, cx_event_time) %>%
+    left_join(comp_changes, by = join_by(product_id, country, competitor_id,
+                                         closest(cx_event_time < change_time))) %>%
+    transmute(product_id, country, competitor_id, cx_event_time,
+              response_delay_h = as.numeric(difftime(change_time, cx_event_time, units = "hours")),
+              response_change_pct = comp_change_pct,
+              response_direction  = comp_change_direction)
 
-event_level <- event_level %>%
-  relocate(product_id, product_category, country, cx_event_time,
-           competitor_id, competitor_name, responded, led, role3)
+  # ... and last competitor price change BEFORE the event (leadership)
+  last_before <- event_grid %>%
+    select(product_id, country, competitor_id, cx_event_time) %>%
+    left_join(comp_changes %>% select(product_id, country, competitor_id, change_time),
+              by = join_by(product_id, country, competitor_id, closest(cx_event_time > change_time))) %>%
+    transmute(product_id, country, competitor_id, cx_event_time,
+              lead_time_h = as.numeric(difftime(cx_event_time, change_time, units = "hours")))
+
+  event_grid %>%
+    left_join(first_after, by = c("product_id", "country", "competitor_id", "cx_event_time")) %>%
+    left_join(last_before, by = c("product_id", "country", "competitor_id", "cx_event_time")) %>%
+    left_join(cx_events,   by = c("product_id", "country", "cx_event_time")) %>%
+    left_join(competitor_attributes, by = c("country", "competitor_id")) %>%
+    mutate(
+      # outcomes
+      responded  = as.integer(!is.na(response_delay_h) & response_delay_h <= RESPONSE_WINDOW_H),
+      led        = as.integer(!is.na(lead_time_h) & lead_time_h <= LEAD_WINDOW_H),
+      same_direction = if_else(responded == 1, response_direction == cx_direction, NA),
+      response_abs_change = if_else(responded == 1, abs(response_change_pct), NA_real_),
+      # role (§3.2): leader if the competitor moved before Company X (this
+      # includes competitors that also moved again afterwards), follower if it
+      # only moved after, otherwise no action
+      role3 = factor(case_when(led == 1 ~ "leader", responded == 1 ~ "follower", TRUE ~ "no_action"),
+                     levels = c("no_action", "follower", "leader")),
+      # price proximity at the event: competitor's pre-event price vs Company X's new price
+      price_gap_pct = (comp_price_before - cx_price) / cx_price,
+      abs_gap       = abs(price_gap_pct)
+    ) %>%
+    relocate(product_id, product_category, country, cx_event_time,
+             competitor_id, competitor_name, responded, led, role3)
+}
+
+event_level <- build_event_level()
 
 log_step(sprintf("01  Done: %s raw rows, %s distinct observations, %s events, %s event-competitor pairs",
                  comma(n_raw_rows), comma(nrow(df)), comma(nrow(cx_events)), comma(nrow(event_level))))
