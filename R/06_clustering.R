@@ -72,15 +72,15 @@ propensity_tbl <- competitor_ccc %>%
 # -----------------------------------------------------------------------------
 # 4. k-means per category
 # -----------------------------------------------------------------------------
-cluster_category <- function(category) {
+cluster_category <- function(category, min_pairs = MIN_EXPOSURE_PAIRS, k = N_CLUSTERS) {
   feat <- propensity_tbl %>%
-    filter(product_category == category, n_pairs >= MIN_EXPOSURE_PAIRS) %>%
+    filter(product_category == category, n_pairs >= min_pairs) %>%
     inner_join(speed_tbl, by = "competitor_id") %>%
     inner_join(aggressiveness_tbl, by = c("competitor_id", "product_category"))
 
   X <- scale(feat[, c("propensity", "speed_multiplier", "aggressiveness")])
   set.seed(SEED)
-  km <- kmeans(X, centers = N_CLUSTERS, nstart = 50)
+  km <- kmeans(X, centers = k, nstart = 50)
 
   # number clusters by mean propensity (1 = most responsive) so labels are stable
   rank_map <- tibble(raw = km$cluster, propensity = feat$propensity) %>%
